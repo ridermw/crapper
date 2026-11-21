@@ -204,12 +204,23 @@ def coverage_percent(covered: int, total: int) -> float:
     return 100.0 * covered / total
 
 
-def percent_for_range(lines: dict[int, tuple[int, int]] | None, start: int, end: int) -> float | None:
+def _line_excluded(line: int, excluded: tuple[tuple[int, int], ...]) -> bool:
+    return any(lo <= line <= hi for lo, hi in excluded)
+
+
+def percent_for_range(
+    lines: dict[int, tuple[int, int]] | None,
+    start: int,
+    end: int,
+    excluded: tuple[tuple[int, int], ...] = (),
+) -> float | None:
     if lines is None:
         return None
     covered = 0
     total = 0
     for line in range(start, end + 1):
+        if excluded and _line_excluded(line, excluded):
+            continue
         entry = lines.get(line)
         if entry is None:
             continue
@@ -280,7 +291,12 @@ def parse_lcov(text: str) -> dict[str, FileCoverage]:
     return out
 
 
-def branch_percent(record, start: int, end: int) -> float | None:
+def branch_percent(
+    record,
+    start: int,
+    end: int,
+    excluded: tuple[tuple[int, int], ...] = (),
+) -> float | None:
     """Branch coverage for a function, or None when that span has no branches."""
 
     branches = getattr(record, "branches", None)
@@ -289,6 +305,8 @@ def branch_percent(record, start: int, end: int) -> float | None:
     covered = 0
     total = 0
     for line in range(start, end + 1):
+        if excluded and _line_excluded(line, excluded):
+            continue
         entry = branches.get(line)
         if entry is None:
             continue
@@ -461,15 +479,16 @@ class CoverageBundle:
             )
         html = self._html_lines(function.path)
         first = _first_line(function)
+        excluded = getattr(function, "excluded_ranges", ())
         if html is not None:
-            return percent_for_range(html, first, function.end_line)
+            return percent_for_range(html, first, function.end_line, excluded)
         record = self._lcov_lines(function.path)
         if record is None:
             return None
-        branched = branch_percent(record, first, function.end_line)
+        branched = branch_percent(record, first, function.end_line, excluded)
         if branched is not None:
             return branched
-        return percent_for_range(record, first, function.end_line)
+        return percent_for_range(record, first, function.end_line, excluded)
 
     def _html_lines(self, path: str) -> dict[int, tuple[int, int]] | None:
         return _lookup(self.form_html, path, self.source_parts)
@@ -777,11 +796,10 @@ def load_bundle(root: Path, *, historical: bool = False) -> CoverageBundle:
     jacoco = _merge_jacoco(root)
     lcov = _merge_lcov(root)
     cobertura = _merge_cobertura(root, historical=historical)
+    # Fresh Cobertura takes precedence over any older LCOV record for the same file,
+    # avoiding stale LCOV branches or hits reviving after a line-only fallback.
     for filename, record in cobertura.items():
-        if filename in lcov:
-            _merge_cobertura_records(lcov, [{filename: record}])
-        else:
-            lcov[filename] = record
+        lcov[filename] = record
     return CoverageBundle(
         lcov=lcov,
         go_profile=go_profile or None,

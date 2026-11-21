@@ -28,6 +28,70 @@ def test_python_def_line_hit_on_import_does_not_cover_never_called_function():
     ]
 
 
+def test_python_factory_coverage_excludes_nested_route_handler_bodies():
+    source = """\
+def build_router(router):
+    @router.get("/users")
+    def list_users(active: bool):
+        if active:
+            return [1]
+        return []
+    return router
+"""
+    # Factory runs (lines 2, 3, 7 hit), handler body (lines 4-6) never runs and has an unhit branch on line 4
+    lcov = parse_lcov(
+        "SF:src/api/routes.py\n"
+        "DA:1,1\nDA:2,1\nDA:3,1\nDA:4,0\nDA:5,0\nDA:6,0\nDA:7,1\n"
+        "BRDA:4,0,0,0\nBRDA:4,0,1,0\n"
+        "end_of_record\n"
+    )
+    bundle = CoverageBundle(lcov=lcov)
+    entries = [make_entry(fn, bundle.percent_for(fn)) for fn in python_functions(source, "src/api/routes.py", "/proj")]
+    assert [(e.name, e.coverage) for e in entries] == [
+        ("build_router", 100.0),
+        ("GET /users", 0.0),
+    ]
+
+
+def test_custom_coverage_command_records_only_fresh_cobertura_and_overrides_stale_lcov(tmp_path):
+    from crapper.coverage import load_bundle
+    from crapper.runners import run_coverage
+
+    cs = _write(tmp_path, "src/App.cs", "class App { int F(int x) { if (x > 0) return 1; return 0; } }\n")
+    # Pre-existing stale Cobertura & stale LCOV with 0% branch
+    _write(
+        tmp_path,
+        "coverage/stale.cobertura.xml",
+        '<coverage><packages><package><classes><class name="App" filename="src/App.cs"><lines><line number="1" hits="0"/></lines></class></classes></package></packages></coverage>',
+    )
+    _write(
+        tmp_path,
+        "coverage/lcov.info",
+        "SF:src/App.cs\nDA:1,0\nBRDA:1,0,0,0\nBRDA:1,0,1,0\nend_of_record\n",
+    )
+    # Custom command writes a fresh Cobertura report with line 1 covered (no branches)
+    fresh_xml = tmp_path / "coverage" / "fresh.cobertura.xml"
+    cmd = (
+        f'python3 -c \'from pathlib import Path; '
+        f'Path("{fresh_xml}").write_text("<coverage><packages><package><classes>'
+        f'<class name=\\"App\\" filename=\\"src/App.cs\\"><lines><line number=\\"1\\" hits=\\"1\\"/></lines></class>'
+        f'</classes></package></packages></coverage>")\''
+    )
+    assert run_coverage(tmp_path, [cs], cmd) == 0
+    bundle = load_bundle(tmp_path, historical=False)
+    assert bundle.lcov["src/App.cs"][1] == (1, 1)
+    assert bundle.lcov["src/App.cs"].branches == {}
+
+
+def test_powershell_explicit_test_file_is_included_in_coverage_script(tmp_path):
+    from crapper.runners import _powershell_coverage_script
+
+    test_file = _write(tmp_path, "tests/Calc.Tests.ps1", "Describe 'x' {}\n")
+    script = _powershell_coverage_script(tmp_path, [test_file], tmp_path / "out.xml")
+    assert "$cfg.CodeCoverage.ExcludeTests = $false;" in script
+    assert "Calc.Tests.ps1" in script
+
+
 def test_python_factory_nested_route_handlers_scored_separately():
     source = """\
 def build_router(router):

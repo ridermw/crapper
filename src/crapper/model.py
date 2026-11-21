@@ -21,6 +21,9 @@ class Function:
     # Coverage starts here, so a line that runs when the function is defined
     # (Python's `def`) does not count as a test reaching it.
     body_line: int = -1
+    # Inclusive line ranges belonging to separately scored nested handlers,
+    # excluded from this enclosing function's line and branch coverage.
+    excluded_ranges: tuple[tuple[int, int], ...] = ()
 
 
 @dataclass(frozen=True)

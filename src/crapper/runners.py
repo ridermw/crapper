@@ -711,9 +711,11 @@ def _cover_csharp(root: Path, files: list[Path]) -> int:
     return 0
 
 
-def _powershell_coverage_script(root: Path, prod_files: list[Path], report_path: Path) -> str:
+def _powershell_coverage_script(
+    root: Path, selected_files: list[Path], report_path: Path
+) -> str:
     quoted_files = ", ".join(
-        "'" + str(p.resolve()).replace("'", "''") + "'" for p in prod_files
+        "'" + str(p.resolve()).replace("'", "''") + "'" for p in selected_files
     )
     root_q = str(root.resolve()).replace("'", "''")
     report_q = str(report_path.resolve()).replace("'", "''")
@@ -727,6 +729,7 @@ def _powershell_coverage_script(root: Path, prod_files: list[Path], report_path:
         f"$cfg.Run.Path = '{root_q}'; "
         "$cfg.Run.PassThru = $true; "
         "$cfg.CodeCoverage.Enabled = $true; "
+        "$cfg.CodeCoverage.ExcludeTests = $false; "
         f"$cfg.CodeCoverage.Path = @({quoted_files}); "
         "$cfg.CodeCoverage.OutputFormat = 'Cobertura'; "
         f"$cfg.CodeCoverage.ReportRoot = '{root_q}'; "
@@ -745,22 +748,47 @@ def _cover_powershell(root: Path, files: list[Path]) -> int:
         _warn("pwsh not found on PATH; PowerShell coverage unavailable.")
         _write_collection_manifest(root, "powershell", "failed", [])
         return 1
-    prod_files = [
+    selected_files = [
         Path(f).resolve()
         for f in files
-        if language_of(f) == "powershell" and not is_test_file(f)
+        if language_of(f) == "powershell"
     ]
-    if not prod_files:
+    if not selected_files:
         _write_collection_manifest(root, "powershell", "failed", [])
         return 1
     report_path = run_dir / "coverage.cobertura.xml"
-    script = _powershell_coverage_script(root, prod_files, report_path)
+    script = _powershell_coverage_script(root, selected_files, report_path)
     code = run_shell(["pwsh", "-NoProfile", "-NonInteractive", "-Command", script], root)
     if code != 0 or not report_path.is_file():
         _write_collection_manifest(root, "powershell", "failed", [])
         return code or 1
     _write_collection_manifest(root, "powershell", "completed", [report_path])
     return 0
+
+
+def _snapshot_cobertura_files(root: Path) -> dict[Path, tuple[int, int]]:
+    snap: dict[Path, tuple[int, int]] = {}
+    for base in ("target/coverage", "coverage", "TestResults"):
+        d = root / base
+        if not d.is_dir():
+            continue
+        for p in d.glob("**/*cobertura*.xml"):
+            if p.is_file():
+                st = p.stat()
+                snap[p.resolve()] = (st.st_mtime_ns, st.st_size)
+    return snap
+
+
+def _record_custom_cobertura_manifests(
+    root: Path, languages: set[str], before: dict[Path, tuple[int, int]]
+) -> None:
+    after = _snapshot_cobertura_files(root)
+    fresh = sorted(p for p, sig in after.items() if before.get(p) != sig)
+    for lang in sorted(languages & {"csharp", "powershell"}):
+        if fresh:
+            _write_collection_manifest(root, lang, "completed", fresh)
+        else:
+            _write_collection_manifest(root, lang, "failed", [])
 
 
 def run_coverage(root: Path, files: list[Path], command: str | None) -> int:
@@ -772,16 +800,24 @@ def run_coverage(root: Path, files: list[Path], command: str | None) -> int:
     """
 
     root = root.resolve()
+    languages = _languages_in(files)
     if command:
+        new_langs = languages & {"csharp", "powershell"}
+        before = _snapshot_cobertura_files(root) if new_langs else {}
+        for lang in new_langs:
+            _write_collection_manifest(root, lang, "in_progress", [])
         code = run_shell(command, root)
         if code != 0:
+            for lang in new_langs:
+                _write_collection_manifest(root, lang, "failed", [])
             _warn(
                 f"Coverage command exited {code}. "
                 "Reports already on disk will not be read."
             )
-        return code
-
-    languages = _languages_in(files)
+            return code
+        if new_langs:
+            _record_custom_cobertura_manifests(root, new_langs, before)
+        return 0
     if "clojure" in languages:
         _cover_clojure(root)
     if "java" in languages:

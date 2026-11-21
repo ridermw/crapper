@@ -239,6 +239,29 @@ def _identity(data: bytes, node, module: str, used: set[str]) -> tuple[str, str]
     return node_text(data, ident), _namespace(data, node, module)
 
 
+def _nested_route_body_ranges(data: bytes, node) -> tuple[tuple[int, int], ...]:
+    """Line ranges of nested route handler bodies scored as separate entries.
+
+    Excludes only each handler's body (not its decorator/def lines executed by
+    the factory) so calling a branchless factory is not penalized by uncalled
+    handler bodies.
+    """
+
+    ranges: list[tuple[int, int]] = []
+    stack = list(reversed(node.children))
+    while stack:
+        current = stack.pop()
+        if current.type == "class_definition":
+            continue
+        if current.type == "function_definition" and _route(data, current) is not None:
+            body = current.child_by_field_name("body")
+            if body is not None:
+                ranges.append((start_line(body), end_line(current)))
+            continue
+        stack.extend(reversed(current.children))
+    return tuple(ranges)
+
+
 def functions_in_source(
     source: str, path: str, source_root: str | None = None
 ) -> list[Function]:
@@ -265,6 +288,7 @@ def functions_in_source(
                 start_byte=node.start_byte,
                 end_byte=node.end_byte,
                 body_line=_body_line(node),
+                excluded_ranges=_nested_route_body_ranges(data, node),
             )
         )
     return found
