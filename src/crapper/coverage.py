@@ -887,6 +887,8 @@ def load_bundle(
     fresh_lcov = _merge_lcov_from_paths(fresh_lcov_paths) if fresh_lcov_paths else {}
     # Keep fresh Cobertura/custom-LCOV separate for lookup precedence, and also
     # populate lcov for callers (such as mutator) that inspect bundle.lcov directly.
+    for filename, record in fresh_lcov.items():
+        lcov[filename] = record
     for filename, record in cobertura.items():
         lcov[filename] = record
     fresh_langs = (

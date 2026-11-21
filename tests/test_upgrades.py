@@ -168,6 +168,8 @@ def test_run_id_blocks_stale_other_language_manifest_and_custom_lcov_is_loaded(t
     assert run_coverage(tmp_path, [m_file], cmd3) == 0
     bundle3 = load_bundle(tmp_path, historical=False, languages={"csharp"})
     assert bundle3.percent_for(m_fn) == 100.0
+    assert bundle3.lcov["src/Multi.cs"][3][0] > 0 and bundle3.lcov["src/Multi.cs"][4][0] > 0
+    assert bundle3.lcov["src/Multi.cs"].branches == {}
 
 
 def test_python_factory_nested_route_handlers_scored_separately():
