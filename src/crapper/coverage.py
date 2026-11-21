@@ -21,7 +21,9 @@ _SPAN = re.compile(
 )
 _LCOV_DA = re.compile(r"DA:(\d+),(\d+)")
 _LCOV_BRDA = re.compile(r"BRDA:(\d+),([^,]*),([^,]*),(-|\d+)")
-_DOCTYPE = re.compile(r"<!DOCTYPE[^>]*>", re.IGNORECASE)
+_DOCTYPE = re.compile(r"<!DOCTYPE\b(?:[^>\[]|\[[^\]]*\])*>", re.IGNORECASE | re.DOTALL)
+_COBERTURA_BRANCH = re.compile(r"^\s*[\d.]+%\s*\((\d+)/(\d+)\)\s*$")
+_XML_ENTITY = re.compile(r"<!\s*ENTITY\b", re.IGNORECASE)
 
 
 class FileCoverage(dict):
@@ -458,21 +460,30 @@ class CoverageBundle:
                 self.source_parts,
             )
         html = self._html_lines(function.path)
+        first = _first_line(function)
         if html is not None:
-            return percent_for_range(html, function.start_line, function.end_line)
+            return percent_for_range(html, first, function.end_line)
         record = self._lcov_lines(function.path)
         if record is None:
             return None
-        branched = branch_percent(record, function.start_line, function.end_line)
+        branched = branch_percent(record, first, function.end_line)
         if branched is not None:
             return branched
-        return percent_for_range(record, function.start_line, function.end_line)
+        return percent_for_range(record, first, function.end_line)
 
     def _html_lines(self, path: str) -> dict[int, tuple[int, int]] | None:
         return _lookup(self.form_html, path, self.source_parts)
 
     def _lcov_lines(self, path: str) -> dict[int, tuple[int, int]] | None:
         return _lookup(self.lcov, path, self.source_parts)
+
+
+def _first_line(function: Function) -> int:
+    """Where line and branch coverage start: the body, when the scanner records it."""
+
+    if function.body_line > 0:
+        return function.body_line
+    return function.start_line
 
 
 def _lookup(index: dict[str, dict], source_path: str, source_parts: list[tuple[str, ...]]):
@@ -558,11 +569,221 @@ def _merge_forms(root: Path) -> dict[str, dict[int, tuple[int, int]]]:
     return found
 
 
-def load_bundle(root: Path) -> CoverageBundle:
+def _cobertura_number(value: str | None, label: str, minimum: int = 0) -> int:
+    try:
+        number = int(value or "")
+    except ValueError as exc:
+        raise ValueError(f"Invalid Cobertura {label}: {value!r}") from exc
+    if number < minimum:
+        raise ValueError(f"Invalid Cobertura {label}: {value!r}")
+    return number
+
+
+def _resolve_cobertura_filename(
+    filename: str, sources: list[str], project_root: Path | None
+) -> str | None:
+    import posixpath
+    from pathlib import PureWindowsPath
+
+    raw = normalize_path(filename)
+    if len(sources) == 1 and not raw.startswith("/") and not PureWindowsPath(raw).is_absolute():
+        raw = posixpath.normpath(normalize_path(sources[0]) + "/" + raw)
+    if project_root is None:
+        return raw
+    root_resolved = project_root.resolve()
+    candidate = Path(raw)
+    if candidate.is_absolute():
+        try:
+            return candidate.resolve().relative_to(root_resolved).as_posix()
+        except ValueError:
+            return None
+    if PureWindowsPath(raw).is_absolute():
+        return None
+    joined = (root_resolved / raw).resolve()
+    try:
+        return joined.relative_to(root_resolved).as_posix()
+    except ValueError:
+        return None
+
+
+def parse_cobertura(
+    text: str, project_root: Path | None = None
+) -> dict[str, FileCoverage]:
+    """Parse Coverlet/Pester Cobertura XML into FileCoverage records.
+
+    Reads class-level `./lines/line` once (falling back to method lines only if
+    a class has no direct `./lines/line` table) so duplicate class/method tables
+    do not inflate coverage. Rejects DOCTYPE/ENTITY declarations.
+    """
+
+    if _XML_ENTITY.search(text):
+        raise ValueError("Cobertura XML entities are not supported")
+    cleaned = _DOCTYPE.sub("", text.lstrip("\ufeff"))
+    root = ET.fromstring(cleaned)
+    if root.tag != "coverage":
+        raise ValueError("Expected Cobertura <coverage> root element")
+    sources = [
+        src.text.strip()
+        for src in root.findall("./sources/source")
+        if src.text and src.text.strip()
+    ]
+    found: dict[str, FileCoverage] = {}
+    for cls in root.iter("class"):
+        raw_name = cls.get("filename")
+        if not raw_name:
+            continue
+        resolved_name = _resolve_cobertura_filename(raw_name, sources, project_root)
+        if resolved_name is None:
+            continue
+        record = found.setdefault(resolved_name, FileCoverage())
+        lines = cls.findall("./lines/line")
+        if not lines:
+            lines = cls.findall("./methods/method/lines/line")
+        for row in lines:
+            number = _cobertura_number(row.get("number"), "line number", 1)
+            hits = _cobertura_number(row.get("hits"), "hit count", 0)
+            prev = record.get(number)
+            record[number] = (1 if (hits > 0 or (prev is not None and prev[0] > 0)) else 0, 1)
+            cond = row.get("condition-coverage")
+            if cond is not None:
+                match = _COBERTURA_BRANCH.fullmatch(cond)
+                if not match:
+                    raise ValueError(f"Invalid Cobertura branch counts: {cond!r}")
+                covered, total = map(int, match.groups())
+                if total < 1 or covered > total:
+                    raise ValueError(f"Invalid Cobertura branch counts: {cond!r}")
+                old = record.branches.get(number)
+                if old is None:
+                    record.branches[number] = (covered, total)
+                else:
+                    record.branches[number] = (max(old[0], covered), max(old[1], total))
+    return found
+
+
+def _merge_cobertura_records(
+    target: dict[str, FileCoverage],
+    report_records: list[dict[str, FileCoverage]],
+) -> None:
+    """Merge same-run Cobertura reports into `target`.
+
+    Line hits are merged by union (preserving 0-hit executable lines).
+    If multiple distinct reports both provide aggregate branch counts for the
+    same file/line, drop branch counts on that file to line-only rather than
+    inventing branch union precision, and emit a diagnostic on stderr.
+    """
+
+    import sys
+
+    branch_sources: dict[tuple[str, int], int] = {}
+    ambiguous_branch_files: set[str] = set()
+    for incoming_map in report_records:
+        for filename, incoming in incoming_map.items():
+            record = target.setdefault(filename, FileCoverage())
+            for line, hit in incoming.items():
+                prev = record.get(line)
+                record[line] = (1 if (hit[0] > 0 or (prev is not None and prev[0] > 0)) else 0, 1)
+            for line, (covered, total) in incoming.branches.items():
+                key = (filename, line)
+                seen_count = branch_sources.get(key, 0) + 1
+                branch_sources[key] = seen_count
+                if seen_count > 1:
+                    ambiguous_branch_files.add(filename)
+                elif line not in record.branches:
+                    record.branches[line] = (covered, total)
+    for filename in sorted(ambiguous_branch_files):
+        target[filename].branches.clear()
+        print(
+            f"crapper: multiple Cobertura reports contain aggregate branch counts for "
+            f"{filename}; using line coverage fallback.",
+            file=sys.stderr,
+        )
+
+
+def read_collection_manifest(root: Path, language: str) -> list[Path] | None:
+    """Return validated report paths from `target/coverage/<language>/collection.json`.
+
+    Returns None when no manifest exists or its status is not `"completed"`.
+    """
+
+    import json
+
+    manifest_path = root / "target" / "coverage" / language / "collection.json"
+    if not manifest_path.is_file():
+        return None
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict) or data.get("status") != "completed":
+        return None
+    if data.get("language") != language:
+        return None
+    raw_reports = data.get("reports")
+    if not isinstance(raw_reports, list) or not raw_reports:
+        return None
+    root_resolved = root.resolve()
+    paths: list[Path] = []
+    for entry in raw_reports:
+        if not isinstance(entry, str):
+            return None
+        candidate = (root_resolved / entry).resolve()
+        try:
+            candidate.relative_to(root_resolved)
+        except ValueError:
+            return None
+        if not candidate.is_file():
+            return None
+        paths.append(candidate)
+    return paths
+
+
+def _cobertura_paths(root: Path, historical: bool) -> list[Path]:
+    paths: list[Path] = []
+    for language in ("csharp", "powershell"):
+        manifest_reports = read_collection_manifest(root, language)
+        if manifest_reports:
+            paths.extend(manifest_reports)
+        elif historical:
+            lang_dir = root / "target" / "coverage" / language
+            if lang_dir.is_dir():
+                paths.extend(sorted(lang_dir.glob("**/*cobertura*.xml")))
+    if historical:
+        for extra in ("coverage", "TestResults"):
+            extra_dir = root / extra
+            if extra_dir.is_dir():
+                paths.extend(sorted(extra_dir.glob("**/*cobertura*.xml")))
+    return paths
+
+
+def _merge_cobertura(root: Path, historical: bool = False) -> dict[str, FileCoverage]:
+    import sys
+
+    paths = _cobertura_paths(root, historical=historical)
+    if not paths:
+        return {}
+    report_records: list[dict[str, FileCoverage]] = []
+    for text in _merge_texts(paths):
+        try:
+            report_records.append(parse_cobertura(text, project_root=root))
+        except (ET.ParseError, ValueError) as exc:
+            print(f"crapper: ignoring malformed Cobertura report: {exc}", file=sys.stderr)
+    merged: dict[str, FileCoverage] = {}
+    _merge_cobertura_records(merged, report_records)
+    return merged
+
+
+def load_bundle(root: Path, *, historical: bool = False) -> CoverageBundle:
     go_profile = _merge_go(root)
     jacoco = _merge_jacoco(root)
+    lcov = _merge_lcov(root)
+    cobertura = _merge_cobertura(root, historical=historical)
+    for filename, record in cobertura.items():
+        if filename in lcov:
+            _merge_cobertura_records(lcov, [{filename: record}])
+        else:
+            lcov[filename] = record
     return CoverageBundle(
-        lcov=_merge_lcov(root),
+        lcov=lcov,
         go_profile=go_profile or None,
         jacoco=jacoco or None,
         form_html=_merge_forms(root),

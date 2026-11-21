@@ -6,10 +6,27 @@ from pathlib import Path
 
 @lru_cache(maxsize=None)
 def parser_for(language: str):
-    from tree_sitter_language_pack import download, get_parser
+    import tree_sitter_language_pack as tslp
 
-    download([language])
-    return get_parser(language)
+    try:
+        return tslp.get_parser(language)
+    except Exception:
+        download = getattr(tslp, "download", None)
+        if callable(download):
+            download([language])
+        return tslp.get_parser(language)
+
+
+def claim(used: set[str], name: str) -> str:
+    if name not in used:
+        used.add(name)
+        return name
+    number = 2
+    while f"{name}#{number}" in used:
+        number += 1
+    chosen = f"{name}#{number}"
+    used.add(chosen)
+    return chosen
 
 
 def parse(source: str, language: str):
