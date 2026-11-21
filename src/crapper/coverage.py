@@ -442,6 +442,8 @@ def parse_jacoco_index(text: str) -> dict[str, list[JacocoMethod]]:
 class CoverageBundle:
     lcov: dict[str, dict[int, tuple[int, int]]] = field(default_factory=dict)
     cobertura: dict[str, FileCoverage] = field(default_factory=dict)
+    fresh_lcov: dict[str, dict[int, tuple[int, int]]] = field(default_factory=dict)
+    fresh_cobertura_languages: frozenset[str] = frozenset()
     go_profile: dict[str, list[tuple[int, int, int, int]]] | None = None
     jacoco: dict[str, list[JacocoMethod]] | None = None
     form_html: dict[str, dict[int, tuple[int, int]]] = field(default_factory=dict)
@@ -484,9 +486,16 @@ class CoverageBundle:
         if html is not None:
             return percent_for_range(html, first, function.end_line, excluded)
         # Prefer fresh Cobertura over any stale LCOV match when both exist.
-        record = _lookup(self.cobertura, function.path, self.source_parts) if self.cobertura else None
-        if record is None:
-            record = self._lcov_lines(function.path)
+        # For fresh C#/PowerShell collections, only fall back to freshly validated
+        # custom LCOV from the same run, never to stale pre-existing coverage/lcov.info.
+        if function.language in self.fresh_cobertura_languages:
+            record = _lookup(self.cobertura, function.path, self.source_parts) if self.cobertura else None
+            if record is None and self.fresh_lcov:
+                record = _lookup(self.fresh_lcov, function.path, self.source_parts)
+        else:
+            record = _lookup(self.cobertura, function.path, self.source_parts) if self.cobertura else None
+            if record is None:
+                record = self._lcov_lines(function.path)
         if record is None:
             return None
         branched = branch_percent(record, first, function.end_line, excluded)
@@ -722,11 +731,50 @@ def _merge_cobertura_records(
         )
 
 
-def read_collection_manifest(root: Path, language: str) -> list[Path] | None:
-    """Return validated report paths from `target/coverage/<language>/collection.json`.
+def _read_latest_run(root: Path) -> tuple[str | None, set[str] | None]:
+    import json
 
-    Returns None when no manifest exists or its status is not `"completed"`.
-    """
+    marker = root / "target" / "coverage" / "latest_run.json"
+    if not marker.is_file():
+        return None, None
+    try:
+        data = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None, None
+    if not isinstance(data, dict):
+        return None, None
+    run_id = data.get("run_id")
+    langs = data.get("languages")
+    return (
+        run_id if isinstance(run_id, str) else None,
+        set(langs) if isinstance(langs, list) else None,
+    )
+
+
+def _validate_manifest_paths(raw: object, root_resolved: Path) -> list[Path] | None:
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        return None
+    paths: list[Path] = []
+    for entry in raw:
+        if not isinstance(entry, str):
+            return None
+        candidate = (root_resolved / entry).resolve()
+        try:
+            candidate.relative_to(root_resolved)
+        except ValueError:
+            return None
+        if not candidate.is_file():
+            return None
+        paths.append(candidate)
+    return paths
+
+
+def read_collection_manifest_details(
+    root: Path, language: str, *, expected_run_id: str | None = None
+) -> tuple[list[Path], list[Path]] | None:
+    """Return validated `(cobertura_paths, lcov_paths)` from `collection.json`."""
 
     import json
 
@@ -741,52 +789,69 @@ def read_collection_manifest(root: Path, language: str) -> list[Path] | None:
         return None
     if data.get("language") != language:
         return None
-    raw_reports = data.get("reports")
-    if not isinstance(raw_reports, list) or not raw_reports:
+    if expected_run_id is not None and data.get("run_id") != expected_run_id:
         return None
     root_resolved = root.resolve()
-    paths: list[Path] = []
-    for entry in raw_reports:
-        if not isinstance(entry, str):
-            return None
-        candidate = (root_resolved / entry).resolve()
-        try:
-            candidate.relative_to(root_resolved)
-        except ValueError:
-            return None
-        if not candidate.is_file():
-            return None
-        paths.append(candidate)
-    return paths
+    cobertura_paths = _validate_manifest_paths(data.get("reports"), root_resolved)
+    lcov_paths = _validate_manifest_paths(data.get("lcov_reports"), root_resolved)
+    if cobertura_paths is None or lcov_paths is None:
+        return None
+    if not cobertura_paths and not lcov_paths:
+        return None
+    return cobertura_paths, lcov_paths
 
 
-def _cobertura_paths(
+def read_collection_manifest(
+    root: Path, language: str, *, expected_run_id: str | None = None
+) -> list[Path] | None:
+    """Return validated Cobertura report paths from `target/coverage/<language>/collection.json`.
+
+    Returns None when no manifest exists, its status is not `"completed"`, or its
+    run_id does not match `expected_run_id`.
+    """
+
+    details = read_collection_manifest_details(root, language, expected_run_id=expected_run_id)
+    if details is None or not details[0]:
+        return None
+    return details[0]
+
+
+def _manifest_report_paths(
     root: Path, historical: bool, languages: set[str] | None = None
-) -> list[Path]:
-    paths: list[Path] = []
-    allowed = ({"csharp", "powershell"} & languages) if languages is not None else {"csharp", "powershell"}
+) -> tuple[list[Path], list[Path]]:
+    cobertura_paths: list[Path] = []
+    fresh_lcov_paths: list[Path] = []
+    expected_run_id: str | None = None
+    run_langs: set[str] | None = None
+    if not historical:
+        expected_run_id, run_langs = _read_latest_run(root)
+    allowed = {"csharp", "powershell"}
+    if languages is not None:
+        allowed &= languages
+    if not historical and run_langs is not None:
+        allowed &= run_langs
     for language in sorted(allowed):
-        manifest_reports = read_collection_manifest(root, language)
-        if manifest_reports:
-            paths.extend(manifest_reports)
+        details = read_collection_manifest_details(
+            root, language, expected_run_id=expected_run_id
+        )
+        if details is not None:
+            cobertura_paths.extend(details[0])
+            fresh_lcov_paths.extend(details[1])
         elif historical:
             lang_dir = root / "target" / "coverage" / language
             if lang_dir.is_dir():
-                paths.extend(sorted(lang_dir.glob("**/*cobertura*.xml")))
+                cobertura_paths.extend(sorted(lang_dir.glob("**/*cobertura*.xml")))
     if historical:
         for extra in ("coverage", "TestResults"):
             extra_dir = root / extra
             if extra_dir.is_dir():
-                paths.extend(sorted(extra_dir.glob("**/*cobertura*.xml")))
-    return paths
+                cobertura_paths.extend(sorted(extra_dir.glob("**/*cobertura*.xml")))
+    return cobertura_paths, fresh_lcov_paths
 
 
-def _merge_cobertura(
-    root: Path, historical: bool = False, languages: set[str] | None = None
-) -> dict[str, FileCoverage]:
+def _merge_cobertura_from_paths(root: Path, paths: list[Path]) -> dict[str, FileCoverage]:
     import sys
 
-    paths = _cobertura_paths(root, historical=historical, languages=languages)
     if not paths:
         return {}
     report_records: list[dict[str, FileCoverage]] = []
@@ -800,20 +865,38 @@ def _merge_cobertura(
     return merged
 
 
+def _merge_lcov_from_paths(paths: list[Path]) -> dict[str, dict[int, tuple[int, int]]]:
+    merged: dict[str, dict[int, tuple[int, int]]] = {}
+    for text in _merge_texts(paths):
+        merged.update(parse_lcov(text))
+    return merged
+
+
 def load_bundle(
     root: Path, *, historical: bool = False, languages: set[str] | None = None
 ) -> CoverageBundle:
     go_profile = _merge_go(root)
     jacoco = _merge_jacoco(root)
     lcov = _merge_lcov(root)
-    cobertura = _merge_cobertura(root, historical=historical, languages=languages)
-    # Keep fresh Cobertura separate for lookup precedence, and also populate lcov
-    # for callers (such as mutator) that inspect bundle.lcov directly.
+    cobertura_paths, fresh_lcov_paths = _manifest_report_paths(
+        root, historical=historical, languages=languages
+    )
+    cobertura = _merge_cobertura_from_paths(root, cobertura_paths)
+    fresh_lcov = _merge_lcov_from_paths(fresh_lcov_paths) if fresh_lcov_paths else {}
+    # Keep fresh Cobertura/custom-LCOV separate for lookup precedence, and also
+    # populate lcov for callers (such as mutator) that inspect bundle.lcov directly.
     for filename, record in cobertura.items():
         lcov[filename] = record
+    fresh_langs = (
+        frozenset()
+        if historical
+        else frozenset({"csharp", "powershell"} & (languages if languages is not None else {"csharp", "powershell"}))
+    )
     return CoverageBundle(
         lcov=lcov,
         cobertura=cobertura,
+        fresh_lcov=fresh_lcov,
+        fresh_cobertura_languages=fresh_langs,
         go_profile=go_profile or None,
         jacoco=jacoco or None,
         form_html=_merge_forms(root),

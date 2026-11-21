@@ -115,10 +115,44 @@ def test_stale_other_language_manifest_ignored_and_short_cobertura_beats_stale_l
         "target/coverage/csharp/fresh.cobertura.xml",
         '<coverage><packages><package><classes><class name="App" filename="App.cs"><lines><line number="1" hits="1"/></lines></class></classes></package></packages></coverage>',
     )
-    _write(tmp_path, "coverage/lcov.info", "SF:src/App.cs\nDA:1,0\nend_of_record\n")
+    _write(tmp_path, "coverage/lcov.info", "SF:src/App.cs\nDA:1,0\nend_of_record\nSF:src/Other.cs\nDA:1,1\nend_of_record\n")
     _write_collection_manifest(tmp_path, "csharp", "completed", [fresh_cs])
     bundle = load_bundle(tmp_path, historical=False, languages={"csharp"})
     assert bundle.percent_for(cs_fn) == 100.0
+    # Omitted C# file in fresh Cobertura must NOT fall back to stale coverage/lcov.info
+    other_fn = functions_in_file("csharp", "class Other { int G() => 1; }\n", "src/Other.cs", str(tmp_path))[0]
+    assert bundle.percent_for(other_fn) is None
+
+
+def test_run_id_blocks_stale_other_language_manifest_and_custom_lcov_is_loaded(tmp_path):
+    from crapper.coverage import load_bundle
+    from crapper.languages import functions_in_file
+    from crapper.runners import run_coverage
+
+    cs_file = _write(tmp_path, "src/App.cs", "class App { int F() => 1; }\n")
+    ps_file = _write(tmp_path, "src/Util.ps1", "function Get-U { return 1 }\n")
+    cs_fn = functions_in_file("csharp", cs_file.read_text(), "src/App.cs", str(tmp_path))[0]
+
+    # Run 1: mixed C# + PowerShell custom command writes a Cobertura report covering App.cs
+    cmd1 = (
+        "python3 -c \"import pathlib; p = pathlib.Path('coverage/mix.cobertura.xml'); "
+        "p.parent.mkdir(parents=True, exist_ok=True); "
+        "p.write_text('<coverage><packages><package><classes>"
+        "<class name=\\\"App\\\" filename=\\\"src/App.cs\\\"><lines><line number=\\\"1\\\" hits=\\\"1\\\"/></lines></class>"
+        "</classes></package></packages></coverage>')\""
+    )
+    assert run_coverage(tmp_path, [cs_file, ps_file], cmd1) == 0
+
+    # Run 2: C#-only custom command writes fresh LCOV covering App.cs at 0% (and does NOT touch PS manifest)
+    cmd2 = (
+        "python3 -c \"import pathlib; p = pathlib.Path('coverage/lcov.info'); "
+        "p.parent.mkdir(parents=True, exist_ok=True); "
+        "p.write_text('SF:src/App.cs\\nDA:1,0\\nend_of_record\\n')\""
+    )
+    assert run_coverage(tmp_path, [cs_file], cmd2) == 0
+    # Even when load_bundle is called WITHOUT languages, latest_run.json blocks the stale PS manifest!
+    bundle = load_bundle(tmp_path, historical=False)
+    assert bundle.percent_for(cs_fn) == 0.0
 
 
 def test_python_factory_nested_route_handlers_scored_separately():
