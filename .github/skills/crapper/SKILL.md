@@ -34,9 +34,13 @@ directory (Python 3.11+; the first run builds the tool's own `.venv`).
   with a plain `crapper`.
 - Coverage comes from each language's test command (coverage.py with pytest,
   `clj -M:cov --lcov`, JaCoCo, `go test -coverprofile`, `npm run coverage`,
-  Vitest or c8, `cargo llvm-cov`). If the tests fail or the tool is missing,
-  that language scores **0% and the snapshot is still written**. 0% everywhere
-  means fix the test run, then rerun. Never refactor on that number.
+  Vitest or c8, `cargo llvm-cov`, `dotnet test --collect:"XPlat Code Coverage"`
+  Cobertura for C#, and Pester 5.7+ Cobertura for PowerShell). For existing
+  languages, if the tests fail or the tool is missing, that language scores
+  **0% and the snapshot is still written**; for C# and PowerShell, failed or
+  missing fresh coverage exits non-zero without writing a misleading 0%
+  snapshot. 0% everywhere means fix the test run, then rerun. Never refactor
+  on that number.
 - A function the coverage report does not mention scores 0%. A renamed or
   moved function is a new entry.
 
