@@ -290,19 +290,19 @@ class CoverageRunError(RuntimeError):
 def _coverage_bundle(options: Options, root: Path, files: list[Path]):
     if options.no_coverage:
         return None
+    langs = {lang for path in files if (lang := language_of(path)) is not None}
     if options.use_existing_coverage:
-        return load_bundle(root, historical=True)
+        return load_bundle(root, historical=True, languages=langs)
     status = run_coverage(root, files, options.coverage_command)
     if options.coverage_command and status not in (0, None):
         return CoverageBundle()
     if status not in (0, None):
-        langs = {language_of(path) for path in files}
         if langs & {"csharp", "powershell"}:
             raise CoverageRunError(
                 f"Coverage collection failed (exit {status}) for new-language targets; "
                 "no metrics were written."
             )
-    return load_bundle(root, historical=False)
+    return load_bundle(root, historical=False, languages=langs)
 
 
 def _threshold_status(options: Options, entries) -> int:

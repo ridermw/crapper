@@ -441,6 +441,7 @@ def parse_jacoco_index(text: str) -> dict[str, list[JacocoMethod]]:
 @dataclass
 class CoverageBundle:
     lcov: dict[str, dict[int, tuple[int, int]]] = field(default_factory=dict)
+    cobertura: dict[str, FileCoverage] = field(default_factory=dict)
     go_profile: dict[str, list[tuple[int, int, int, int]]] | None = None
     jacoco: dict[str, list[JacocoMethod]] | None = None
     form_html: dict[str, dict[int, tuple[int, int]]] = field(default_factory=dict)
@@ -482,7 +483,10 @@ class CoverageBundle:
         excluded = getattr(function, "excluded_ranges", ())
         if html is not None:
             return percent_for_range(html, first, function.end_line, excluded)
-        record = self._lcov_lines(function.path)
+        # Prefer fresh Cobertura over any stale LCOV match when both exist.
+        record = _lookup(self.cobertura, function.path, self.source_parts) if self.cobertura else None
+        if record is None:
+            record = self._lcov_lines(function.path)
         if record is None:
             return None
         branched = branch_percent(record, first, function.end_line, excluded)
@@ -756,9 +760,12 @@ def read_collection_manifest(root: Path, language: str) -> list[Path] | None:
     return paths
 
 
-def _cobertura_paths(root: Path, historical: bool) -> list[Path]:
+def _cobertura_paths(
+    root: Path, historical: bool, languages: set[str] | None = None
+) -> list[Path]:
     paths: list[Path] = []
-    for language in ("csharp", "powershell"):
+    allowed = ({"csharp", "powershell"} & languages) if languages is not None else {"csharp", "powershell"}
+    for language in sorted(allowed):
         manifest_reports = read_collection_manifest(root, language)
         if manifest_reports:
             paths.extend(manifest_reports)
@@ -774,10 +781,12 @@ def _cobertura_paths(root: Path, historical: bool) -> list[Path]:
     return paths
 
 
-def _merge_cobertura(root: Path, historical: bool = False) -> dict[str, FileCoverage]:
+def _merge_cobertura(
+    root: Path, historical: bool = False, languages: set[str] | None = None
+) -> dict[str, FileCoverage]:
     import sys
 
-    paths = _cobertura_paths(root, historical=historical)
+    paths = _cobertura_paths(root, historical=historical, languages=languages)
     if not paths:
         return {}
     report_records: list[dict[str, FileCoverage]] = []
@@ -791,17 +800,20 @@ def _merge_cobertura(root: Path, historical: bool = False) -> dict[str, FileCove
     return merged
 
 
-def load_bundle(root: Path, *, historical: bool = False) -> CoverageBundle:
+def load_bundle(
+    root: Path, *, historical: bool = False, languages: set[str] | None = None
+) -> CoverageBundle:
     go_profile = _merge_go(root)
     jacoco = _merge_jacoco(root)
     lcov = _merge_lcov(root)
-    cobertura = _merge_cobertura(root, historical=historical)
-    # Fresh Cobertura takes precedence over any older LCOV record for the same file,
-    # avoiding stale LCOV branches or hits reviving after a line-only fallback.
+    cobertura = _merge_cobertura(root, historical=historical, languages=languages)
+    # Keep fresh Cobertura separate for lookup precedence, and also populate lcov
+    # for callers (such as mutator) that inspect bundle.lcov directly.
     for filename, record in cobertura.items():
         lcov[filename] = record
     return CoverageBundle(
         lcov=lcov,
+        cobertura=cobertura,
         go_profile=go_profile or None,
         jacoco=jacoco or None,
         form_html=_merge_forms(root),

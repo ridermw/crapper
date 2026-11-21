@@ -92,6 +92,35 @@ def test_powershell_explicit_test_file_is_included_in_coverage_script(tmp_path):
     assert "Calc.Tests.ps1" in script
 
 
+def test_stale_other_language_manifest_ignored_and_short_cobertura_beats_stale_lcov(tmp_path):
+    from crapper.coverage import load_bundle
+    from crapper.languages import functions_in_file
+    from crapper.runners import _write_collection_manifest
+
+    cs_fn = functions_in_file("csharp", "class App { int F() => 1; }\n", "src/App.cs", str(tmp_path))[0]
+    stale_report = _write(
+        tmp_path,
+        "coverage/old_mix.cobertura.xml",
+        '<coverage><packages><package><classes><class name="App" filename="src/App.cs"><lines><line number="1" hits="1"/></lines></class></classes></package></packages></coverage>',
+    )
+    # Old powershell manifest still references old_mix.cobertura.xml; a fresh csharp-only run must NOT load it
+    _write_collection_manifest(tmp_path, "powershell", "completed", [stale_report])
+    _write_collection_manifest(tmp_path, "csharp", "failed", [])
+    bundle_cs_only = load_bundle(tmp_path, historical=False, languages={"csharp"})
+    assert bundle_cs_only.percent_for(cs_fn) is None
+
+    # Short-keyed fresh Cobertura ("App.cs") beats stale exact-keyed LCOV ("src/App.cs")
+    fresh_cs = _write(
+        tmp_path,
+        "target/coverage/csharp/fresh.cobertura.xml",
+        '<coverage><packages><package><classes><class name="App" filename="App.cs"><lines><line number="1" hits="1"/></lines></class></classes></package></packages></coverage>',
+    )
+    _write(tmp_path, "coverage/lcov.info", "SF:src/App.cs\nDA:1,0\nend_of_record\n")
+    _write_collection_manifest(tmp_path, "csharp", "completed", [fresh_cs])
+    bundle = load_bundle(tmp_path, historical=False, languages={"csharp"})
+    assert bundle.percent_for(cs_fn) == 100.0
+
+
 def test_python_factory_nested_route_handlers_scored_separately():
     source = """\
 def build_router(router):
