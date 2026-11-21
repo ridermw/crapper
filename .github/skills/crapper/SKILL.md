@@ -1,6 +1,6 @@
 ---
 name: crapper
-description: Use when measuring or lowering CRAP scores, when a function is complex and under-tested, when crapper prints a high score or exits 2 under --threshold, when coverage reads 0% unexpectedly, or when .metrics/crap.edn must be refreshed for uml-viewer, in Clojure, Java, Go, TypeScript, Rust, or Python projects.
+description: Use when measuring or lowering CRAP scores, when a function is complex and under-tested, when crapper prints a high score or exits 2 under --threshold, when coverage reads 0% unexpectedly, or when .metrics/crap.edn must be refreshed for uml-viewer, in Clojure, Java, Go, TypeScript, JavaScript, Rust, Python, C#, or PowerShell projects.
 ---
 
 # crapper

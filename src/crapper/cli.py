@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -42,9 +43,9 @@ Detect the language of each source file and score it with the CRAP metric
 CRAP = CC² × (1 − coverage)³ + CC. Writes .metrics/crap.edn for uml-viewer
 and prints a report sorted worst first.
 
-Languages: Clojure (.clj .cljc .cljs .bb), Java (.java), Go (.go),
+Languages: Clojure (.clj .cljc .cljs .bb), Java (.java), Go (.go), C# (.cs),
 TypeScript and JavaScript (.ts .tsx .mts .cts .js .jsx .mjs .cjs),
-Rust (.rs), Python (.py).
+Rust (.rs), Python (.py), PowerShell (.ps1 .psm1).
 
 Options:
   -h, --help                    Print this help and exit.
@@ -173,12 +174,14 @@ class GitError(Exception):
 
 
 def _git(root: Path, args: list[str]) -> subprocess.CompletedProcess[str]:
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     return subprocess.run(
         ["git", "-C", str(root), *args],
         check=False,
         capture_output=True,
         text=True,
         encoding="utf-8",
+        env=env,
     )
 
 
@@ -280,15 +283,26 @@ def _show_help(options: Options) -> int:
     return options.exit_code
 
 
+class CoverageRunError(RuntimeError):
+    """A new-language coverage run did not produce validated coverage."""
+
+
 def _coverage_bundle(options: Options, root: Path, files: list[Path]):
     if options.no_coverage:
         return None
+    langs = {lang for path in files if (lang := language_of(path)) is not None}
     if options.use_existing_coverage:
-        return load_bundle(root)
+        return load_bundle(root, historical=True, languages=langs)
     status = run_coverage(root, files, options.coverage_command)
     if options.coverage_command and status not in (0, None):
         return CoverageBundle()
-    return load_bundle(root)
+    if status not in (0, None):
+        if langs & {"csharp", "powershell"}:
+            raise CoverageRunError(
+                f"Coverage collection failed (exit {status}) for new-language targets; "
+                "no metrics were written."
+            )
+    return load_bundle(root, historical=False, languages=langs)
 
 
 def _threshold_status(options: Options, entries) -> int:
@@ -319,7 +333,11 @@ def run(argv: list[str] | None = None) -> int:
         print("No source files to analyze.")
         return 0
 
-    entries = analyze_files(files, root, _coverage_bundle(options, root, files))
+    try:
+        entries = analyze_files(files, root, _coverage_bundle(options, root, files))
+    except (ValueError, CoverageRunError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     metrics = write_metrics(entries, root)
     print(format_report(entries), end="", flush=True)
     print(f"Wrote {metrics}", file=sys.stderr)

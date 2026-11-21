@@ -7,6 +7,7 @@ tool, or a failed run, scores its functions at 0%.
 from __future__ import annotations
 
 import json
+import re
 import shlex
 import shutil
 import subprocess
@@ -70,7 +71,7 @@ def _clean_dir(path: Path) -> None:
         shutil.rmtree(path)
 
 
-_COVERAGE_DIRS = {"typescript", "rust", "go", "python"}
+_COVERAGE_DIRS = {"typescript", "rust", "go", "python", "csharp", "powershell"}
 
 
 def _outside_language_dirs(coverage: Path, path: Path) -> bool:
@@ -148,6 +149,13 @@ def _uses_vitest(package: Path, scripts: dict) -> bool:
     return any((package / name).is_file() for name in _VITEST_CONFIGS)
 
 
+_SEMVER = re.compile(r"^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$")
+
+
+def _is_valid_semver(value: object) -> bool:
+    return isinstance(value, str) and _SEMVER.match(value) is not None
+
+
 def _vitest_version(package: Path) -> str | None:
     installed = package / "node_modules" / "vitest" / "package.json"
     if installed.is_file():
@@ -156,17 +164,51 @@ def _vitest_version(package: Path) -> str | None:
         except json.JSONDecodeError as exc:
             _warn(f"{installed}: {exc.msg}")
             data = None
-        if isinstance(data, dict) and isinstance(data.get("version"), str):
+        if isinstance(data, dict) and _is_valid_semver(data.get("version")):
             return data["version"]
     return None
 
 
 def _manifest_snapshot(package: Path) -> dict[Path, bytes | None]:
     snapshot: dict[Path, bytes | None] = {}
-    for name in ("package.json", "package-lock.json", "npm-shrinkwrap.json"):
+    for name in (
+        "package.json",
+        "package-lock.json",
+        "npm-shrinkwrap.json",
+        "pnpm-lock.yaml",
+        "yarn.lock",
+        "bun.lockb",
+        "bun.lock",
+    ):
         path = package / name
         snapshot[path] = path.read_bytes() if path.is_file() else None
     return snapshot
+
+
+def _package_manager(package: Path) -> str:
+    if (package / "pnpm-lock.yaml").is_file() or (package / "node_modules" / ".pnpm").is_dir():
+        return "pnpm"
+    if (package / "yarn.lock").is_file():
+        return "yarn"
+    if (package / "bun.lockb").is_file() or (package / "bun.lock").is_file():
+        return "bun"
+    data = _package_json(package) or {}
+    pm = str(data.get("packageManager", ""))
+    for candidate in ("pnpm", "yarn", "bun"):
+        if pm.startswith(candidate):
+            return candidate
+    return "npm"
+
+
+def _vitest_install_command(package: Path, spec: str) -> list[str]:
+    manager = _package_manager(package)
+    if manager == "pnpm":
+        return ["pnpm", "add", "-D", "--no-lockfile", "--ignore-scripts", spec]
+    if manager == "yarn":
+        return ["yarn", "add", "-D", "--no-lockfile", "--ignore-scripts", spec]
+    if manager == "bun":
+        return ["bun", "add", "-d", "--no-save", "--ignore-scripts", spec]
+    return ["npm", "install", "--no-save", "--no-package-lock", "--ignore-scripts", spec]
 
 
 def _restore_manifests(snapshot: dict[Path, bytes | None]) -> None:
@@ -191,10 +233,7 @@ def _ensure_vitest_coverage(package: Path) -> bool:
     )
     snapshot = _manifest_snapshot(package)
     try:
-        code = run_shell(
-            ["npm", "install", "--no-save", "--no-package-lock", spec],
-            package,
-        )
+        code = run_shell(_vitest_install_command(package, spec), package)
     finally:
         _restore_manifests(snapshot)
     ready = code == 0 and (package / "node_modules" / "@vitest" / "coverage-v8").is_dir()
@@ -562,25 +601,280 @@ def _cover_rust(root: Path, files: list[Path]) -> None:
             _warn(f"Rust coverage exited {code} in {module}. Rust coverage will score 0%.")
 
 
+def _write_latest_run(root: Path, run_id: str, languages: set[str]) -> None:
+    manifest_dir = root / "target" / "coverage"
+    manifest_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "run_id": run_id,
+        "languages": sorted(languages),
+    }
+    (manifest_dir / "latest_run.json").write_text(
+        json.dumps(payload, indent=2) + "\n", encoding="utf-8"
+    )
+
+
+def _write_collection_manifest(
+    root: Path,
+    language: str,
+    status: str,
+    reports: list[Path],
+    *,
+    run_id: str | None = None,
+    lcov_reports: list[Path] | None = None,
+) -> None:
+    manifest_dir = root / "target" / "coverage" / language
+    manifest_dir.mkdir(parents=True, exist_ok=True)
+    root_resolved = root.resolve()
+    rel_reports = [report.resolve().relative_to(root_resolved).as_posix() for report in reports]
+    payload: dict[str, object] = {
+        "status": status,
+        "language": language,
+        "root": root_resolved.as_posix(),
+        "reports": rel_reports,
+    }
+    if run_id is not None:
+        payload["run_id"] = run_id
+    if lcov_reports:
+        payload["lcov_reports"] = [
+            report.resolve().relative_to(root_resolved).as_posix() for report in lcov_reports
+        ]
+    (manifest_dir / "collection.json").write_text(
+        json.dumps(payload, indent=2) + "\n", encoding="utf-8"
+    )
+
+
+def dotnet_target(root: Path, files: list[Path] | None = None) -> Path:
+    """Resolve an unambiguous .sln/.slnx (or single .csproj fallback) within `root`."""
+
+    root_resolved = root.resolve()
+    solutions = sorted(
+        p for p in root_resolved.iterdir() if p.is_file() and p.suffix.lower() in {".sln", ".slnx"}
+    )
+    if len(solutions) == 1:
+        return solutions[0]
+    if len(solutions) > 1:
+        raise ValueError(
+            f"Multiple .NET solutions found in {root_resolved}: "
+            f"{', '.join(p.name for p in solutions)}. Specify one target or use --coverage-command."
+        )
+    if files:
+        nested: set[Path] = set()
+        for f in files:
+            if language_of(f) != "csharp":
+                continue
+            cur = Path(f).resolve().parent
+            while True:
+                found = sorted(
+                    p for p in cur.iterdir() if p.is_file() and p.suffix.lower() in {".sln", ".slnx"}
+                )
+                if found:
+                    nested.update(found)
+                    break
+                if cur == root_resolved or cur.parent == cur:
+                    break
+                cur = cur.parent
+        if len(nested) == 1:
+            target = next(iter(nested))
+            target.resolve().relative_to(root_resolved)
+            return target
+        if len(nested) > 1:
+            raise ValueError(
+                f"Ambiguous .NET solutions found: {', '.join(sorted(p.name for p in nested))}."
+            )
+    projects = sorted(
+        p
+        for p in root_resolved.rglob("*.csproj")
+        if not {"bin", "obj", "TestResults"}.intersection(p.relative_to(root_resolved).parts)
+    )
+    if len(projects) == 1:
+        return projects[0]
+    raise ValueError(
+        "C# requires one unambiguous solution (.sln or .slnx) or project (.csproj) "
+        f"under {root_resolved}; otherwise supply --coverage-command."
+    )
+
+
+def _cover_csharp(root: Path, files: list[Path], *, run_id: str | None = None) -> int:
+    run_dir = root / "target" / "coverage" / "csharp"
+    _clean_dir(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    _write_collection_manifest(root, "csharp", "in_progress", [], run_id=run_id)
+    if not shutil.which("dotnet"):
+        _warn("dotnet SDK not found on PATH; C# coverage unavailable.")
+        _write_collection_manifest(root, "csharp", "failed", [], run_id=run_id)
+        return 1
+    try:
+        target = dotnet_target(root, files)
+    except ValueError as exc:
+        _warn(str(exc))
+        _write_collection_manifest(root, "csharp", "failed", [], run_id=run_id)
+        return 1
+    rel_target = target.resolve().relative_to(root.resolve()).as_posix()
+    code = run_shell(
+        [
+            "dotnet",
+            "test",
+            rel_target,
+            "--nologo",
+            "--collect:XPlat Code Coverage",
+            "--results-directory",
+            str(run_dir),
+        ],
+        root,
+    )
+    reports = sorted(run_dir.glob("**/*cobertura*.xml"))
+    if code != 0 or not reports:
+        if code == 0 and not reports:
+            _warn(
+                "dotnet test produced no Cobertura XML. Ensure coverlet.collector is referenced "
+                "in your VSTest test project, or supply --coverage-command."
+            )
+        _write_collection_manifest(root, "csharp", "failed", [], run_id=run_id)
+        return code or 1
+    _write_collection_manifest(root, "csharp", "completed", reports, run_id=run_id)
+    return 0
+
+
+def _powershell_coverage_script(
+    root: Path, selected_files: list[Path], report_path: Path
+) -> str:
+    quoted_files = ", ".join(
+        "'" + str(p.resolve()).replace("'", "''") + "'" for p in selected_files
+    )
+    root_q = str(root.resolve()).replace("'", "''")
+    report_q = str(report_path.resolve()).replace("'", "''")
+    return (
+        "$ErrorActionPreference = 'Stop'; "
+        "$m = Get-Module -ListAvailable Pester | Sort-Object Version -Descending | Select-Object -First 1; "
+        "if (-not $m -or $m.Version -lt [version]'5.7.0') { "
+        "Write-Error 'Pester 5.7.0+ is required for PowerShell coverage.'; exit 1 }; "
+        "Import-Module Pester -MinimumVersion 5.7.0 -Force; "
+        "$cfg = New-PesterConfiguration; "
+        f"$cfg.Run.Path = '{root_q}'; "
+        "$cfg.Run.PassThru = $true; "
+        "$cfg.CodeCoverage.Enabled = $true; "
+        "$cfg.CodeCoverage.ExcludeTests = $false; "
+        f"$cfg.CodeCoverage.Path = @({quoted_files}); "
+        "$cfg.CodeCoverage.OutputFormat = 'Cobertura'; "
+        f"$cfg.CodeCoverage.ReportRoot = '{root_q}'; "
+        f"$cfg.CodeCoverage.OutputPath = '{report_q}'; "
+        "$res = Invoke-Pester -Configuration $cfg; "
+        "if ($res.FailedCount -gt 0 -or $res.TotalCount -eq 0) { exit 1 }"
+    )
+
+
+def _cover_powershell(root: Path, files: list[Path], *, run_id: str | None = None) -> int:
+    run_dir = root / "target" / "coverage" / "powershell"
+    _clean_dir(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    _write_collection_manifest(root, "powershell", "in_progress", [], run_id=run_id)
+    if not shutil.which("pwsh"):
+        _warn("pwsh not found on PATH; PowerShell coverage unavailable.")
+        _write_collection_manifest(root, "powershell", "failed", [], run_id=run_id)
+        return 1
+    selected_files = [
+        Path(f).resolve()
+        for f in files
+        if language_of(f) == "powershell"
+    ]
+    if not selected_files:
+        _write_collection_manifest(root, "powershell", "failed", [], run_id=run_id)
+        return 1
+    report_path = run_dir / "coverage.cobertura.xml"
+    script = _powershell_coverage_script(root, selected_files, report_path)
+    code = run_shell(["pwsh", "-NoProfile", "-NonInteractive", "-Command", script], root)
+    if code != 0 or not report_path.is_file():
+        _write_collection_manifest(root, "powershell", "failed", [], run_id=run_id)
+        return code or 1
+    _write_collection_manifest(root, "powershell", "completed", [report_path], run_id=run_id)
+    return 0
+
+
+def _file_sig(p: Path) -> tuple[int, int, int, int]:
+    st = p.stat()
+    return (st.st_mtime_ns, st.st_ctime_ns, st.st_size, st.st_ino)
+
+
+def _snapshot_cobertura_files(root: Path) -> dict[Path, tuple[int, int, int, int]]:
+    snap: dict[Path, tuple[int, int, int, int]] = {}
+    for base in ("target/coverage", "coverage", "TestResults"):
+        d = root / base
+        if not d.is_dir():
+            continue
+        for p in d.glob("**/*cobertura*.xml"):
+            if p.is_file():
+                snap[p.resolve()] = _file_sig(p)
+    return snap
+
+
+def _snapshot_lcov_files(root: Path) -> dict[Path, tuple[int, int, int, int]]:
+    snap: dict[Path, tuple[int, int, int, int]] = {}
+    for base in ("target/coverage", "coverage"):
+        d = root / base
+        if not d.is_dir():
+            continue
+        for p in d.glob("**/lcov.info"):
+            if p.is_file():
+                snap[p.resolve()] = _file_sig(p)
+    return snap
+
+
+def _record_custom_cobertura_manifests(
+    root: Path,
+    languages: set[str],
+    before_cobertura: dict[Path, tuple[int, int, int, int]],
+    before_lcov: dict[Path, tuple[int, int, int, int]],
+    *,
+    run_id: str,
+) -> None:
+    after_cobertura = _snapshot_cobertura_files(root)
+    after_lcov = _snapshot_lcov_files(root)
+    fresh_cobertura = sorted(p for p, sig in after_cobertura.items() if before_cobertura.get(p) != sig)
+    fresh_lcov = sorted(p for p, sig in after_lcov.items() if before_lcov.get(p) != sig)
+    for lang in sorted(languages & {"csharp", "powershell"}):
+        if fresh_cobertura or fresh_lcov:
+            _write_collection_manifest(
+                root, lang, "completed", fresh_cobertura, run_id=run_id, lcov_reports=fresh_lcov
+            )
+        else:
+            _write_collection_manifest(root, lang, "failed", [], run_id=run_id)
+
+
 def run_coverage(root: Path, files: list[Path], command: str | None) -> int:
     """Generate coverage reports for the languages present in `files`.
 
-    Returns the custom command's status. A non-zero status means the caller
-    must not read reports already on disk. Per-language runs return 0; a
-    failed tool is reported and that language scores 0% when it wrote nothing.
+    Returns the custom command's status, or a non-zero status when C# or
+    PowerShell fresh collection fails (without discarding other languages'
+    coverage). Existing languages return 0 as before.
     """
 
+    import uuid
+
     root = root.resolve()
+    languages = _languages_in(files)
+    new_langs = languages & {"csharp", "powershell"}
+    run_id = uuid.uuid4().hex
+    if new_langs:
+        _write_latest_run(root, run_id, new_langs)
     if command:
+        before_cobertura = _snapshot_cobertura_files(root) if new_langs else {}
+        before_lcov = _snapshot_lcov_files(root) if new_langs else {}
+        for lang in new_langs:
+            _write_collection_manifest(root, lang, "in_progress", [], run_id=run_id)
         code = run_shell(command, root)
         if code != 0:
+            for lang in new_langs:
+                _write_collection_manifest(root, lang, "failed", [], run_id=run_id)
             _warn(
                 f"Coverage command exited {code}. "
                 "Reports already on disk will not be read."
             )
-        return code
-
-    languages = _languages_in(files)
+            return code
+        if new_langs:
+            _record_custom_cobertura_manifests(
+                root, new_langs, before_cobertura, before_lcov, run_id=run_id
+            )
+        return 0
     if "clojure" in languages:
         _cover_clojure(root)
     if "java" in languages:
@@ -593,4 +887,13 @@ def run_coverage(root: Path, files: list[Path], command: str | None) -> int:
         _cover_python(root, files)
     if "rust" in languages:
         _cover_rust(root, files)
-    return 0
+    new_lang_status = 0
+    if "csharp" in languages:
+        cs_code = _cover_csharp(root, files, run_id=run_id)
+        if cs_code != 0:
+            new_lang_status = cs_code
+    if "powershell" in languages:
+        ps_code = _cover_powershell(root, files, run_id=run_id)
+        if ps_code != 0 and new_lang_status == 0:
+            new_lang_status = ps_code
+    return new_lang_status

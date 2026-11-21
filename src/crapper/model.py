@@ -17,6 +17,13 @@ class Function:
     # Mutator uses the span to give a nested handler the sites inside it.
     start_byte: int = -1
     end_byte: int = -1
+    # First line of the body. -1 when the language does not record it.
+    # Coverage starts here, so a line that runs when the function is defined
+    # (Python's `def`) does not count as a test reaching it.
+    body_line: int = -1
+    # Inclusive line ranges belonging to separately scored nested handlers,
+    # excluded from this enclosing function's line and branch coverage.
+    excluded_ranges: tuple[tuple[int, int], ...] = ()
 
 
 @dataclass(frozen=True)
