@@ -695,8 +695,10 @@ def parse_cobertura(
 def _merge_cobertura_records(
     target: dict[str, FileCoverage],
     report_records: list[dict[str, FileCoverage]],
+    *,
+    kind: str = "Cobertura",
 ) -> None:
-    """Merge same-run Cobertura reports into `target`.
+    """Merge same-run coverage reports into `target`.
 
     Line hits are merged by union (preserving 0-hit executable lines).
     If multiple distinct reports both provide aggregate branch counts for the
@@ -725,7 +727,7 @@ def _merge_cobertura_records(
     for filename in sorted(ambiguous_branch_files):
         target[filename].branches.clear()
         print(
-            f"crapper: multiple Cobertura reports contain aggregate branch counts for "
+            f"crapper: multiple {kind} reports contain aggregate branch counts for "
             f"{filename}; using line coverage fallback.",
             file=sys.stderr,
         )
@@ -865,10 +867,10 @@ def _merge_cobertura_from_paths(root: Path, paths: list[Path]) -> dict[str, File
     return merged
 
 
-def _merge_lcov_from_paths(paths: list[Path]) -> dict[str, dict[int, tuple[int, int]]]:
-    merged: dict[str, dict[int, tuple[int, int]]] = {}
-    for text in _merge_texts(paths):
-        merged.update(parse_lcov(text))
+def _merge_lcov_from_paths(paths: list[Path]) -> dict[str, FileCoverage]:
+    report_records = [parse_lcov(text) for text in _merge_texts(paths)]
+    merged: dict[str, FileCoverage] = {}
+    _merge_cobertura_records(merged, report_records, kind="LCOV")
     return merged
 
 

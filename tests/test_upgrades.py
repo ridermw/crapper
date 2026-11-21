@@ -154,6 +154,21 @@ def test_run_id_blocks_stale_other_language_manifest_and_custom_lcov_is_loaded(t
     bundle = load_bundle(tmp_path, historical=False)
     assert bundle.percent_for(cs_fn) == 0.0
 
+    # Multiple fresh LCOV reports for the same file merge line hits by union and fall back on overlapping branches
+    multi_src = "class Multi {\n  int F(int x) {\n    if (x > 0) return 1;\n    return 0;\n  }\n}\n"
+    m_file = _write(tmp_path, "src/Multi.cs", multi_src)
+    m_fn = functions_in_file("csharp", multi_src, "src/Multi.cs", str(tmp_path))[0]
+    cmd3 = (
+        "python3 -c \"import pathlib; "
+        "p1 = pathlib.Path('target/coverage/a/lcov.info'); p1.parent.mkdir(parents=True, exist_ok=True); "
+        "p1.write_text('SF:src/Multi.cs\\nDA:3,1\\nDA:4,0\\nBRDA:3,0,0,1\\nBRDA:3,0,1,0\\nend_of_record\\n'); "
+        "p2 = pathlib.Path('target/coverage/b/lcov.info'); p2.parent.mkdir(parents=True, exist_ok=True); "
+        "p2.write_text('SF:src/Multi.cs\\nDA:3,0\\nDA:4,1\\nBRDA:3,0,0,0\\nBRDA:3,0,1,1\\nend_of_record\\n')\""
+    )
+    assert run_coverage(tmp_path, [m_file], cmd3) == 0
+    bundle3 = load_bundle(tmp_path, historical=False, languages={"csharp"})
+    assert bundle3.percent_for(m_fn) == 100.0
+
 
 def test_python_factory_nested_route_handlers_scored_separately():
     source = """\
